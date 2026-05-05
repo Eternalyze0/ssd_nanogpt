@@ -114,7 +114,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(43 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -365,12 +365,6 @@ while True:
 
 # -----------------------------------------------------------------------------
 # Offline self‑distillation phase (Zhang et al., arXiv:2604.01193)
-# -----------------------------------------------------------------------------
-# Offline self‑distillation phase (Zhang et al., arXiv:2604.01193)
-# -----------------------------------------------------------------------------
-# Offline self‑distillation phase (Zhang et al., arXiv:2604.01193)
-# -----------------------------------------------------------------------------
-# Offline self‑distillation phase (Zhang et al., arXiv:2604.01193)
 if self_distill:
     if master_process:
         print("\n--- Starting offline self‑distillation (SSD) ---")
@@ -378,10 +372,15 @@ if self_distill:
         print(f"Before SSD: train loss {loss_before['train']:.4f}, val loss {loss_before['val']:.4f}")
 
     effective_block_size = raw_model.config.block_size
-    if ssd_prompt_len > effective_block_size:
-        ssd_prompt_len = effective_block_size
-    if ssd_prompt_len + ssd_gen_len > effective_block_size:
-        ssd_gen_len = effective_block_size - ssd_prompt_len
+
+    # If prompt length is 0, we use an internal start token (not trained on)
+    if ssd_prompt_len == 0:
+        internal_prompt_len = 1   # one start token to kick off generation
+    else:
+        internal_prompt_len = ssd_prompt_len
+
+    if internal_prompt_len + ssd_gen_len > effective_block_size:
+        ssd_gen_len = effective_block_size - internal_prompt_len
         if master_process:
             print(f"Adjusted ssd_gen_len to {ssd_gen_len} to fit block_size {effective_block_size}")
 
@@ -390,22 +389,30 @@ if self_distill:
             print("WARNING: ssd_gen_len <= 0, skipping self‑distillation.")
     else:
         if master_process:
-            print(f"SSD: prompt_len={ssd_prompt_len}, gen_len={ssd_gen_len}")
+            if ssd_prompt_len == 0:
+                print(f"SSD: prompt_len=0 (using internal start token), gen_len={ssd_gen_len}")
+            else:
+                print(f"SSD: prompt_len={ssd_prompt_len}, gen_len={ssd_gen_len}")
 
-        # --- Create a fresh optimizer for SSD only ---
-        # Use the same beta1/beta2/weight_decay as the main optimizer, but a separate LR.
+        # Fresh optimizer for SSD only
         ssd_optimizer = model.configure_optimizers(
-            weight_decay,             # same weight decay
-            ssd_lr,                   # separate LR
+            weight_decay,
+            ssd_lr,
             (beta1, beta2),
             device_type
         )
 
         for ssd_iter in range(ssd_iters):
-            X_prompt, _ = get_batch('train')
-            prompts = X_prompt[:, :ssd_prompt_len]
+            # 1. Create the starting sequence
+            if ssd_prompt_len > 0:
+                # Random prompt from vocabulary
+                prompts = torch.randint(0, raw_model.config.vocab_size,
+                                        (batch_size, ssd_prompt_len), device=device)
+            else:
+                # Only one start token (token 0) – no real prompt
+                prompts = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
 
-            # 1. Generate completions (teacher, no grad)
+            # 2. Generate completions (teacher, no grad)
             raw_model.eval()
             with torch.no_grad():
                 gen_seq = prompts
@@ -418,19 +425,25 @@ if self_distill:
                     gen_seq = torch.cat([gen_seq, next_token], dim=1)
             raw_model.train()
 
-            # 2. Prepare student inputs/targets (contiguous to avoid model.py view crash)
-            X_ssd = gen_seq[:, :-1].contiguous()
-            Y_ssd = gen_seq[:, 1:].contiguous()
+            # 3. Student inputs/targets
+            X_ssd = gen_seq[:, :-1].contiguous()   # (B, total_len-1)
+            Y_ssd = gen_seq[:, 1:].contiguous()    # (B, total_len-1)
 
-            # 3. Forward with student (targets included → full logits)
+            # 4. Forward with targets
             with ctx:
                 logits_ssd, _ = model(X_ssd, Y_ssd)
 
-            # 4. Loss only on the generated continuation
-            start_idx = ssd_prompt_len - 1
+            # 5. Loss only on the generated continuation
+            #    If ssd_prompt_len > 0:  start_idx = prompt_len-1,  len = gen_len
+            #    If ssd_prompt_len == 0: start_idx = 0,  len = gen_len  (skip the start token's prediction)
+            if ssd_prompt_len == 0:
+                start_idx = 0
+            else:
+                start_idx = ssd_prompt_len - 1
             end_idx = start_idx + ssd_gen_len
-            logits_gen = logits_ssd[:, start_idx:end_idx, :]
-            targets_gen = Y_ssd[:, start_idx:end_idx]
+
+            logits_gen = logits_ssd[:, start_idx:end_idx, :]   # (B, gen_len, vocab)
+            targets_gen = Y_ssd[:, start_idx:end_idx]          # (B, gen_len)
 
             loss_ssd = F.cross_entropy(
                 logits_gen.reshape(-1, logits_gen.size(-1)),
@@ -438,7 +451,6 @@ if self_distill:
                 ignore_index=-1
             )
 
-            # Backward with the SSD optimizer
             scaler.scale(loss_ssd).backward()
             if grad_clip != 0.0:
                 scaler.unscale_(ssd_optimizer)
@@ -455,7 +467,7 @@ if self_distill:
             print(f"\nSelf‑distillation finished.")
             print(f"Before SSD: train loss {loss_before['train']:.4f}, val loss {loss_before['val']:.4f}")
             print(f"After SSD:  train loss {loss_after['train']:.4f}, val loss {loss_after['val']:.4f}")
-            # No SSD checkpoint is saved – the main model/optimizer state remains unchanged from the end of training.
+            # No checkpoint saved
 
 if ddp:
     destroy_process_group()
